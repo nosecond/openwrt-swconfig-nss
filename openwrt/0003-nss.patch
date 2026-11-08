@@ -1,0 +1,196 @@
+diff --git a/package/kernel/mac80211/Makefile b/package/kernel/mac80211/Makefile
+index aec88b692b..5296d88b63 100644
+--- a/package/kernel/mac80211/Makefile
++++ b/package/kernel/mac80211/Makefile
+@@ -282,9 +282,15 @@ ifeq ($(BUILD_VARIANT),smallbuffers)
+ 	C_DEFINES+= -DCONFIG_ATH10K_SMALLBUFFERS
+ endif
+ 
++# ath11k's NSS offload calls into qca-nss-drv, which stages its headers to
++# $(STAGING_DIR)/usr/include/qca-nss-drv from its own Build/InstallDev.  The
++# build-order dependency that makes them exist by now is the +kmod-qca-nss-drv
++# on KernelPackage/ath11k in ath.mk - without it mac80211 compiles first.
++NSS_CFLAGS:=-I$(STAGING_DIR)/usr/include/qca-nss-drv
++
+ MAKE_OPTS:= \
+ 	$(subst -C $(LINUX_DIR),-C "$(PKG_BUILD_DIR)",$(KERNEL_MAKEOPTS)) \
+-	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES)" \
++	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES) $(NSS_CFLAGS)" \
+ 	KLIB_BUILD="$(LINUX_DIR)" \
+ 	MODPROBE=true \
+ 	KLIB=$(TARGET_MODULES_DIR) \
+diff --git a/package/kernel/mac80211/ath.mk b/package/kernel/mac80211/ath.mk
+index 9adb8914cd..3e1f7decf0 100644
+--- a/package/kernel/mac80211/ath.mk
++++ b/package/kernel/mac80211/ath.mk
+@@ -318,7 +318,7 @@ define KernelPackage/ath11k
+   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
+   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
+   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
+-  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
++  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers +kmod-qca-nss-drv
+   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
+ endef
+ 
+diff --git a/package/kernel/qca-ssdk/Makefile b/package/kernel/qca-ssdk/Makefile
+index a5588d5032..d64c8ffdcd 100644
+--- a/package/kernel/qca-ssdk/Makefile
++++ b/package/kernel/qca-ssdk/Makefile
+@@ -21,7 +21,7 @@ define KernelPackage/qca-ssdk
+   CATEGORY:=Kernel modules
+   SUBMENU:=Network Devices
+   TITLE:=Qualcom SSDK switch driver
+-  DEPENDS:=@(TARGET_qualcommax)
++  DEPENDS:=@(TARGET_qualcommax) +kmod-swconfig
+   FILES:=$(PKG_BUILD_DIR)/qca-ssdk.ko
+   AUTOLOAD:=$(call AutoLoad,30,qca-ssdk)
+ endef
+@@ -34,11 +34,48 @@ GCC_VERSION=$(shell echo "$(CONFIG_GCC_VERSION)" | sed 's/[^0-9.]*\([0-9.]*\).*/
+ 
+ LNX_CONFIG_OPTS = LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)' PRJ_PATH=$(PKG_BUILD_DIR) MODULE_TYPE=KSLIB modules
+ 
++# OpenWrt backports upstream v6.16's two-argument .match_phy_device into
++# kernel 6.12, so LINUX_VERSION_CODE cannot tell the two prototypes apart.
++# Ask the kernel tree we are actually building against.  The grep pattern
++# must contain no parentheses: make counts them inside $(shell ...), and a
++# stray ')' closes the call early and leaks the rest into EXTRA_CFLAGS.
++SSDK_MATCH_PHY_DRV := $(shell grep -q 'match_phy_device.*phydev,' \
++	$(LINUX_DIR)/include/linux/phy.h 2>/dev/null && echo -DSSDK_MATCH_PHY_DEVICE_HAS_DRV)
++
+ EXTRA_CFLAGS:= \
+ 	-fno-stack-protector \
+ 	-Wno-missing-prototypes \
+ 	-Wno-missing-declarations \
+-	-I$(STAGING_DIR)/usr/include
++	-I$(STAGING_DIR)/usr/include \
++	$(SSDK_MATCH_PHY_DRV)
++
++# Per-subtarget SSDK feature selection.
++#
++# Upstream hard-disables every chip/PHY driver on the make command line,
++# which overrides ssdk's own ./config (a command-line variable always wins).
++# On ipq50xx that leaves qca-ssdk.ko with zero ISISC symbols, so it cannot
++# drive an external QCA8337 at all - boards like cmcc,pz-l8 were forced onto
++# the mainline qca8k DSA driver, whose 2-byte tag the NSS firmware cannot
++# parse.  Re-enable what ssdk's own config would have selected for MP:
++#   ISISC_ENABLE     - AR8327/AR8337 (QCA8337) chip driver
++#   SWCONFIG_FEATURE - swconfig/UCI front end (config switch / switch_vlan)
++#
++# The PHY drivers stay at their upstream FALSE: this board only needs ssdk
++# for the *external* QCA8337, and enabling IN_MP_PHY / IN_QCA803X_PHY /
++# IN_QCA808X_PHY makes ssdk register phylib drivers that compete with the
++# mainline IPQ5018 GE PHY and qca83xx drivers for the same phy_devices.
++# (IN_MP_PHY also implies IN_QCA808X_PHY, because src/hsl/phy/mpge_phy.c
++# and mpge_led.c call qca808x_phy_* directly - see the qca808x patch.)
++SSDK_SWCONFIG = disable
++SSDK_ISISC = disable
++SSDK_MP_PHY = FALSE
++SSDK_QCA803X_PHY = FALSE
++SSDK_QCA808X_PHY = FALSE
++
++ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq50xx")
++  SSDK_SWCONFIG = enable
++  SSDK_ISISC = enable
++endif
+ 
+ MAKE_FLAGS+= \
+ 	TARGET_NAME=$(CONFIG_TARGET_NAME) \
+@@ -52,10 +89,10 @@ MAKE_FLAGS+= \
+ 	EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
+ 	SoC=$(CONFIG_TARGET_SUBTARGET) \
+ 	SHELL="$(BASH)" \
+-	PTP_FEATURE=disable SWCONFIG_FEATURE=disable \
+-	ISISC_ENABLE=disable MHT_ENABLE=disable \
+-	IN_QCA803X_PHY=FALSE IN_QCA808X_PHY=FALSE \
+-	IN_MALIBU_PHY=FALSE IN_MP_PHY=FALSE \
++	PTP_FEATURE=disable SWCONFIG_FEATURE=$(SSDK_SWCONFIG) \
++	ISISC_ENABLE=$(SSDK_ISISC) MHT_ENABLE=disable \
++	IN_QCA803X_PHY=$(SSDK_QCA803X_PHY) IN_QCA808X_PHY=$(SSDK_QCA808X_PHY) \
++	IN_MALIBU_PHY=FALSE IN_MP_PHY=$(SSDK_MP_PHY) \
+ 	$(LNX_CONFIG_OPTS)
+ 
+ ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq807x")
+diff --git a/target/linux/generic/files/drivers/net/phy/swconfig_leds.c b/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
+index 1fcd4432b5..9221f8cfeb 100644
+--- a/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
++++ b/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
+@@ -478,6 +478,15 @@ swconfig_led_work_func(struct work_struct *work)
+ 					sw_trig->link_speed[i] =
+ 						SWCONFIG_LED_PORT_SPEED_1000;
+ 					break;
++				default:
++					/*
++					 * 2500/5000/10000 and anything added
++					 * later: this trigger only has a
++					 * "gigabit or faster" bucket.
++					 */
++					sw_trig->link_speed[i] =
++						SWCONFIG_LED_PORT_SPEED_1000;
++					break;
+ 				}
+ 			}
+ 		}
+diff --git a/target/linux/generic/files/include/linux/switch.h b/target/linux/generic/files/include/linux/switch.h
+index 4e6238470d..e0d7fb636d 100644
+--- a/target/linux/generic/files/include/linux/switch.h
++++ b/target/linux/generic/files/include/linux/switch.h
+@@ -45,6 +45,10 @@ enum switch_port_speed {
+ 	SWITCH_PORT_SPEED_10 = 10,
+ 	SWITCH_PORT_SPEED_100 = 100,
+ 	SWITCH_PORT_SPEED_1000 = 1000,
++	/* multi-gig speeds, as used by QSDK/qca-ssdk */
++	SWITCH_PORT_SPEED_2500 = 2500,
++	SWITCH_PORT_SPEED_5000 = 5000,
++	SWITCH_PORT_SPEED_10000 = 10000,
+ };
+ 
+ struct switch_port_link {
+@@ -146,6 +150,16 @@ struct switch_portmap {
+ 	const char *s;
+ };
+ 
++/*
++ * Linked list of name/value option pairs handed to a SWITCH_TYPE_EXT
++ * attribute.  Used by qca-ssdk's "switch_ext" attribute.
++ */
++struct switch_ext {
++	struct switch_ext *next;
++	const char *option_name;
++	const char *option_value;
++};
++
+ struct switch_val {
+ 	const struct switch_attr *attr;
+ 	unsigned int port_vlan;
+@@ -155,6 +169,7 @@ struct switch_val {
+ 		u32 i;
+ 		struct switch_port *ports;
+ 		struct switch_port_link *link;
++		struct switch_ext *ext_val;
+ 	} value;
+ };
+ 
+diff --git a/target/linux/generic/files/include/uapi/linux/switch.h b/target/linux/generic/files/include/uapi/linux/switch.h
+index ea449653fa..3ab2c52fb2 100644
+--- a/target/linux/generic/files/include/uapi/linux/switch.h
++++ b/target/linux/generic/files/include/uapi/linux/switch.h
+@@ -89,6 +89,8 @@ enum switch_val_type {
+ 	SWITCH_TYPE_PORTS,
+ 	SWITCH_TYPE_LINK,
+ 	SWITCH_TYPE_NOVAL,
++	/* QSDK/qca-ssdk extended attribute (switch_val.value.ext_val) */
++	SWITCH_TYPE_EXT,
+ };
+ 
+ /* port nested attributes */
+--- a/package/kernel/linux/modules/netfilter.mk
++++ b/package/kernel/linux/modules/netfilter.mk
+@@ -330,7 +330,7 @@
+   KCONFIG:=$(KCONFIG_IPT_IPOPT)
+   FILES:=$(foreach mod,$(IPT_IPOPT-m),$(LINUX_DIR)/net/$(mod).ko)
+   AUTOLOAD:=$(call AutoProbe,$(notdir $(IPT_IPOPT-m)))
+-  $(call AddDepends/ipt)
++  $(call AddDepends/ipt,+kmod-nf-conntrack)
+ endef
+ 
+ define KernelPackage/ipt-ipopt/description

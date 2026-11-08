@@ -1,0 +1,258 @@
+diff --git a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-xd27.dts b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-xd27.dts
+index bcdfe35..29ff0c3 100644
+--- a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-xd27.dts
++++ b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-xd27.dts
+@@ -5,6 +5,7 @@
+ #include "ipq5018.dtsi"
+ #include "ipq5018-ess.dtsi"
+ #include "ipq5018-qcn6122.dtsi"
++#include "ipq5018-nss.dtsi"
+ 
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
+@@ -24,7 +25,7 @@
+ 	};
+ 
+ 	chosen {
+-		bootargs-append = " root=/dev/ubiblock0_1 swiotlb=1 coherent_pool=512K";
++		bootargs-append = " root=/dev/ubiblock0_1 swiotlb=1 coherent_pool=2M";
+ 		stdout-path = "serial0:115200n8";
+ 	};
+ 
+@@ -65,6 +66,10 @@
+ 	};
+ };
+ 
++/*&q6_region {
++	reg = <0x0 0x4b000000 0x0 0x4100000>;
++};
++*/
+ &sleep_clk {
+ 	clock-frequency = <32000>;
+ };
+@@ -132,6 +137,14 @@
+ 						reg = <0x0 0x6>;
+ 						#nvmem-cell-cells = <1>;
+ 					};
++
++					caldata_ipq5018: calibration@1000 {
++						reg = <0x1000 0x20000>;
++					};
++
++					caldata_qcn6122: calibration@26800 {
++						reg = <0x26800 0x20000>;
++					};
+ 				};
+ 			};
+ 		};
+@@ -169,20 +182,75 @@
+ 			phy_address = <7>;
+ 		};
+ 
+-		// MAC1 -> Uniphy --- SGMII --- QCA8337 SerDes(Port6)
++		/*
++		 * MAC1 -> Uniphy --- SGMII --- QCA8337 SerDes(Port6)
++		 *
++		 * Deliberately no mdiobus here, matching the vendor DT.  With
++		 * one, ssdk associates MAC1 with that bus and probes it for a
++		 * PHY - it finds the QCA8337's internal PHY at address 0,
++		 * misreads the ID and configures the port as PHY-attached
++		 * (visible as "uniphy will output clock as 25000000Hz")
++		 * instead of the forced fixed link this SGMII segment is.
++		 */
+ 		port@1 {
+ 			port_id = <2>;
+-			mdiobus = <&mdio1>;
+ 			forced-speed = <1000>;
+ 			forced-duplex = <1>;
+ 		};
+ 	};
+ };
+ 
++&ess_instance {
++	num_devices = <2>;
++
++	ess_switch1: ess-switch1@1 {
++		device_id = <1>;
++		compatible = "qcom,ess-switch-qca83xx";
++		switch_access_mode = "mdio";
++		mdio-bus = <&mdio1>;
++
++		switch_cpu_bmp = <0x40>;	/* port 6                */
++		switch_lan_bmp = <0x0e>;	/* ports 1, 2, 3         */
++		switch_wan_bmp = <0x00>;	/* ports             */
++
++		/* register/value pairs written verbatim at switch init */
++		qca,ar8327-initvals = <
++			0x04 0x07600000		/* PORT0_PAD_MODE  */
++			0x08 0x01000000		/* PORT5_PAD_MODE  */
++			0x0c 0x00000080		/* PORT6_PAD_MODE  */
++			0x10 0x002613a0		/* POWER_ON_STRAP  */
++			0xe4 0x000aa545		/* MAC_POWER_SEL   */
++			0xe0 0xc74164de		/* SGMII_CTRL      */
++			0x7c 0x0000004e		/* PORT0_STATUS: 1000M/full/rx+tx */
++			0x94 0x0000004e		/* PORT6_STATUS: 1000M/full/rx+tx */
++		>;
++
++		qcom,port_phyinfo {
++			// QCA8337 Port1 <- Phy0 -> LAN3
++			port@0 {
++				port_id = <1>;
++				phy_address = <0>;
++			};
++
++			// QCA8337 Port2 <- Phy1 -> LAN2
++			port@1 {
++				port_id = <2>;
++				phy_address = <1>;
++			};
++
++			// QCA8337 Port3 <- Phy2 -> LAN1
++			port@2 {
++				port_id = <3>;
++				phy_address = <2>;
++			};
++
++		};
++	};
++};
++
+ &dp1 {
+ 	status = "okay";
+ 
+-	label = "wan";
+ 	nvmem-cells = <&lan_addr 1>;
+ 	nvmem-cell-names = "mac-address";
+ 
+@@ -191,7 +259,6 @@
+ &dp2 {
+ 	status = "okay";
+ 
+-	label = "lan";
+ 	phy-mode = "sgmii";
+ 
+ 	nvmem-cells = <&lan_addr 0>;
+@@ -214,59 +281,18 @@
+ 	pinctrl-names = "default";
+ 	reset-gpios = <&tlmm 39 GPIO_ACTIVE_LOW>;
+ 
+-	qca8337_0: ethernet-phy@0 {
++	ethernet-phy@0 {
+ 		reg = <0>;
+ 	};
+ 
+-	qca8337_1: ethernet-phy@1 {
++	ethernet-phy@1 {
+ 		reg = <1>;
+ 	};
+ 
+-	qca8337_2: ethernet-phy@2 {
++	ethernet-phy@2 {
+ 		reg = <2>;
+ 	};
+ 
+-	ethernet-switch@10 {
+-		compatible = "qca,qca8337";
+-		reg = <0x10>;
+-		#address-cells = <1>;
+-		#size-cells = <0>;
+-
+-		ports {
+-			#address-cells = <1>;
+-			#size-cells = <0>;
+-
+-			port@1 {
+-				reg = <1>;
+-				label = "lan3";
+-				phy-handle = <&qca8337_0>;
+-			};
+-
+-			port@2 {
+-				reg = <2>;
+-				label = "lan2";
+-				phy-handle = <&qca8337_1>;
+-			};
+-
+-			port@3 {
+-				reg = <3>;
+-				label = "lan1";
+-				phy-handle = <&qca8337_2>;
+-			};
+-
+-			port@6 {
+-				reg = <6>;
+-				phy-mode = "sgmii";
+-				ethernet = <&dp2>;
+-				qca,sgmii-enable-pll;
+-
+-				fixed-link {
+-					speed = <1000>;
+-					full-duplex;
+-				};
+-			};
+-		};
+-	};
+ };
+ 
+ &tlmm {
+@@ -338,9 +364,12 @@
+ 	status = "okay";
+ 
+ 	qcom,rproc = <&q6_wcss_pd1>;
++	qcom,userpd-subsys-name = "q6v5_wcss_userpd1";
+ 	qcom,ath11k-calibration-variant = "HONOR-XD27";
+-	qcom,ath11k-fw-memory-mode = <2>;
++	qcom,ath11k-fw-memory-mode = <1>;
+ 	qcom,bdf-addr = <0x4c400000>;
++	nvmem-cells = <&caldata_ipq5018>, <&lan_addr 1>;
++	nvmem-cell-names = "calibration", "mac-address";
+ };
+ 
+ &wifi1 {
+@@ -349,7 +378,9 @@
+ 	qcom,rproc = <&q6_wcss_pd2>;
+ 	qcom,userpd-subsys-name = "q6v5_wcss_userpd2";
+ 	qcom,ath11k-calibration-variant = "HONOR-XD27";
+-	qcom,ath11k-fw-memory-mode = <2>;
++	qcom,ath11k-fw-memory-mode = <1>;
+ 	qcom,bdf-addr = <0x4d100000>;
+ 	qcom,m3-dump-addr = <0x4df00000>;
++	nvmem-cells = <&caldata_qcn6122>, <&lan_addr 2>;
++	nvmem-cell-names = "calibration", "mac-address";
+ };
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+index a774fed..eb4a864 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+@@ -15,7 +15,7 @@ iodata,wn-dax3000gr)
+ 	ucidef_set_led_netdev "wan" "WAN" "green:wan" "wan" "tx rx link_10 link_100 link_1000"
+ 	;;
+ honor,xd27)
+-	ucidef_set_led_netdev "wan" "WAN" "green:status" "wan" "tx rx link_10 link_100 link_1000"
++	ucidef_set_led_netdev "wan" "WAN" "green:status" "eth0" "tx rx link_10 link_100 link_1000"
+ 	;;
+ linksys,mr5500)
+ 	ucidef_set_led_netdev "lan1-port-link" "LAN1-PORT-LINK" "qca8k-0.0:00:green:lan" "lan1" "link_10 link_100 link_1000"
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+index 5617081..72b9d94 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+@@ -18,13 +18,17 @@ ipq50xx_setup_interfaces()
+ 		;;
+ 	cmcc,mr3000d-ci|\
+ 	cmcc,pz-l8|\
+-	honor,xd27|\
+ 	linksys,mx2000|\
+ 	linksys,mx5500|\
+ 	linksys,spnmx56|\
+ 	xiaomi,ax6000)
+ 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+ 		;;
++	honor,xd27)
++		ucidef_set_interface_wan "eth0"
++		ucidef_add_switch "switch1" \
++			"6u@eth1" "1:lan:3" "2:lan:2" "3:lan:1"
++		;;
+ 	linksys,mx6200|\
+ 	yuncore,ax830|\
+ 	yuncore,ax850)

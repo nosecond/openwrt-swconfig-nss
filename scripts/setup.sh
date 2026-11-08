@@ -1,10 +1,10 @@
 #!/bin/bash
-# Turn a clean OpenWrt v25.12.5 checkout into a buildable pz-l8 NSS tree.
+# Turn a clean OpenWrt checkout into a buildable NSS tree.
 #
 # Usage:  scripts/setup.sh /path/to/openwrt
 #
 # Everything this project changes falls into five buckets:
-#   1. edits to files OpenWrt already ships   -> openwrt/0001-cmcc-pz-l8-nss.patch
+#   1. edits to files OpenWrt already ships   -> openwrt/0001-nss.patch
 #   2. files OpenWrt does not have            -> openwrt/tree/, copied in place
 #   3. our own packages                       -> feed/, wired in as a feed
 #   4. patches to packages in other feeds     -> openwrt/feeds/, copied once the
@@ -25,24 +25,78 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 [ -f "$OW/rules.mk" ] || { echo "$OW does not look like an OpenWrt tree"; exit 1; }
 
 # ---------------------------------------------------------------- 1. base version
-if [ -d "$OW/.git" ]; then
-    have=$(git -C "$OW" describe --tags --exact-match 2>/dev/null || echo "unknown")
-    say "OpenWrt base: $have"
-    if [ "$have" != "v25.12.5" ]; then
-        echo "WARNING: this project is developed against v25.12.5."
-        echo "         Patch 1 is a plain diff and will likely fail elsewhere."
+say "OpenWrt base version"
+
+ver_field() {
+    local var=$1 file=$2 line rhs
+    # last assignment wins; allow := ?= = and surrounding whitespace
+    line=$(sed -n "s/^[[:space:]]*${var}[[:space:]]*:[?=]*[[:space:]]*//p" "$file" | tail -n1)
+    [ -n "$line" ] || { echo ""; return; }
+    # $(if $(X),$(X),<default>)  ->  <default>
+    if printf '%s' "$line" | grep -q '^\$(if '; then
+        # strip trailing ')' then take text after the last ','
+        rhs=$(printf '%s' "$line" | sed 's/)[[:space:]]*$//' | sed 's/.*,//')
+    else
+        rhs=$line
     fi
+    # trim surrounding whitespace
+    printf '%s' "$rhs" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+ver=""
+if [ -f "$OW/include/version.mk" ]; then
+    ver_num=$(ver_field VERSION_NUMBER "$OW/include/version.mk")
+    ver_code=$(ver_field VERSION_CODE   "$OW/include/version.mk")
+    ver="${ver_num:-unknown}${ver_code:+ ($ver_code)}"
+elif [ -f "$OW/version" ]; then
+    ver_code=$(head -n1 "$OW/version" | tr -d '[:space:]')
+    ver="unknown (code: ${ver_code:-unknown})"
 fi
+[ -n "$ver" ] || ver="unknown (no version information found)"
+
+echo "  detected: $ver"
+echo
+echo "  This project is developed against a specific OpenWrt release."
+echo "  Patchs is a plain diff and will fail on other trees."
+echo
+printf '  Press SPACE to continue, Ctrl-C to abort: '
+# Wait until a space is pressed.  Read one char at a time; ignore everything
+# else so a stray Enter or letter does not blow past the warning.
+while IFS= read -rsn1 key; do
+    [ "$key" = " " ] && break
+done
+echo
 
 # ---------------------------------------------------------------- 2. tracked edits
 say "Applying edits to upstream files"
-PATCH="$HERE/openwrt/0001-cmcc-pz-l8-nss.patch"
-if git -C "$OW" apply --reverse --check "$PATCH" 2>/dev/null; then
-    echo "already applied, skipping"
-else
-    git -C "$OW" apply --verbose "$PATCH"
-fi
+PATCHES_DIR="$HERE/openwrt"
+# Every *.patch in openwrt/ is applied, in filename order.  Each patch is
+# idempotent on its own: if applying it in reverse would succeed, it is
+# already in the tree and is skipped.
+shopt -s nullglob
+patches=( "$PATCHES_DIR"/*.patch )
+shopt -u nullglob
 
+if [ ${#patches[@]} -eq 0 ]; then
+    echo "  no *.patch files in $PATCHES_DIR, nothing to do"
+else
+    for PATCH in "${patches[@]}"; do
+        name=$(basename "$PATCH")
+        if git -C "$OW" apply --reverse --check "$PATCH" 2>/dev/null; then
+            echo "  $name: already applied, skipping"
+        else
+            echo "  $name: applying"
+            git -C "$OW" apply --verbose "$PATCH" || {
+                echo "ERROR: failed to apply $name"
+                echo "       The tree may be at a different base, or the patch"
+                echo "       may be partially applied.  Check with:"
+                echo "         git -C $OW status"
+                echo "         git -C $OW apply --check --verbose $PATCH"
+                exit 1
+            }
+        fi
+    done
+fi
 # ---------------------------------------------------------------- 3. new files
 say "Copying files that do not exist upstream"
 ( cd "$HERE/openwrt/tree" && find . -type f -print0 |
@@ -52,12 +106,12 @@ say "Copying files that do not exist upstream"
   done )
 
 # ---------------------------------------------------------------- 4. feed
-say "Registering the pzl8 package feed"
+say "Registering the package feed"
 FEEDS="$OW/feeds.conf"
 [ -f "$FEEDS" ] || cp "$OW/feeds.conf.default" "$FEEDS"
-grep -q '^src-link pzl8 ' "$FEEDS" ||
-    echo "src-link pzl8 $HERE/feed" >> "$FEEDS"
-grep '^src-link pzl8 ' "$FEEDS"
+grep -q '^src-link nss ' "$FEEDS" ||
+    echo "src-link nss $HERE/feed" >> "$FEEDS"
+grep '^src-link nss ' "$FEEDS"
 
 ( cd "$OW" && ./scripts/feeds update -a >/dev/null && ./scripts/feeds install -a >/dev/null )
 echo "feeds updated and installed"
@@ -80,8 +134,6 @@ cp -a "$HERE/files/." "$OW/files/"
 find "$OW/files" -type f | sed "s|$OW/|  |"
 # init scripts must stay executable through the image build
 chmod +x "$OW"/files/etc/init.d/* 2>/dev/null || true
-# rpcd runs these as programs; a 644 plugin never registers its ubus object
-chmod +x "$OW"/files/usr/libexec/rpcd/* 2>/dev/null || true
 
 # ---------------------------------------------------------------- 7. config
 # An existing .config is someone's menuconfig session and is left alone.
@@ -90,7 +142,7 @@ if [ -f "$OW/.config" ] && [ "${RESEED:-0}" != 1 ]; then
     say "Keeping the existing .config  (RESEED=1 to replace it with the seed)"
 else
     say "Seeding .config"
-    cp "$HERE/config/cmcc_pz-l8.config" "$OW/.config"
+    cp "$HERE/config/nss.config" "$OW/.config"
 fi
 
 # Always run this: it fills in defaults for anything new since the config was
@@ -121,4 +173,4 @@ fi
 
 say "Ready.  Build with:  cd $OW && make -j\$(nproc)"
 echo "        Pick packages with:  cd $OW && make menuconfig"
-echo "        Keep your selection: cd $OW && ./scripts/diffconfig.sh > $HERE/config/cmcc_pz-l8.config"
+echo "        Keep your selection: cd $OW && ./scripts/diffconfig.sh > $HERE/config/nss.config"

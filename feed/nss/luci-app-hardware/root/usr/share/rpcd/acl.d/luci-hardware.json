@@ -1,0 +1,10 @@
+{
+	"luci-hardware": {
+		"description": "Grant access to the hardware status",
+		"read": {
+			"ubus": {
+				"luci.hardware": [ "status" ]
+			}
+		}
+	}
+}
