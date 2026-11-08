@@ -1,4 +1,4 @@
-name: Build CMCC PZ-L8 (NSS)
+name: Build HONOR XD27 (NSS)
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
       openwrt_ref:
         description: 'OpenWrt tag or commit to build against'
         required: false
-        default: 'v25.12.5'
+        default: 'v25.12.6'
       make_release:
         description: 'Publish a GitHub release with the images'
         type: boolean
@@ -24,7 +24,7 @@ on:
         default: false
 
 env:
-  OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'v25.12.5' }}
+  OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'v25.12.6' }}
   TZ: Asia/Shanghai
 
 # One build per branch. A newer push cancels the older run rather than racing
@@ -48,7 +48,7 @@ jobs:
       - name: Checkout this project
         uses: actions/checkout@v4
         with:
-          path: pzl8-nss
+          path: nss
 
       - name: Free up disk space
         run: |
@@ -81,61 +81,7 @@ jobs:
         # actions/checkout preserves it, so if this ever fails with Permission
         # denied the repository has lost the bit and that is worth seeing.
         run: |
-          pzl8-nss/scripts/setup.sh "$GITHUB_WORKSPACE/openwrt"
-
-      # SONiC fullcone NAT from openwrt-sonic-fullcone: its kernel, libnftnl,
-      # nftables and fw4 patches and the LuCI options, put in place by that
-      # project's own script.  CI-only for the same reason as Argon below.  There
-      # is nothing to select afterwards - it builds into nft_masq, xt_MASQUERADE
-      # and packages the image already has - and the image ships with it off.
-      - name: Add SONiC fullcone NAT
-        env:
-          FULLCONE_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "$FULLCONE_REPO" fullcone
-
-          # Tracking master, so record what that actually was for this image.
-          FULLCONE_SHA=$(git -C fullcone rev-parse HEAD)
-          git -C fullcone --no-pager log -1 --format='fullcone %h  %ci  %s'
-          echo "FULLCONE_COMMIT=$(git -C fullcone rev-parse --short HEAD)" >> "$GITHUB_ENV"
-
-          # Needs the feeds installed, which setup.sh has done.
-          ( cd openwrt && bash "$GITHUB_WORKSPACE/fullcone/add_sonic_fullcone.sh" ) |
-              tee "$RUNNER_TEMP/fullcone.log"
-
-          # The script skips whatever it cannot place and still exits 0.  An
-          # image that says fullcone and has none is worse than a failed build.
-          grep -q '=== Done: [0-9]* applied, 0 skipped ===' "$RUNNER_TEMP/fullcone.log" ||
-              { echo "::error::add_sonic_fullcone.sh skipped something"; exit 1; }
-
-          # It clones master again by itself, seconds after the clone above.  If
-          # master moved in between, the commit recorded above is not the one
-          # that was applied.
-          [ "$(git ls-remote "$FULLCONE_REPO" HEAD | cut -f1)" = "$FULLCONE_SHA" ] ||
-              { echo "::error::fullcone master moved during this step, re-run it"; exit 1; }
-
-      # Argon is not in OpenWrt's luci feed, so it is cloned here rather than by
-      # setup.sh - a local build should not depend on a network fetch it did not
-      # ask for, and the seed config stays free of a symbol that only resolves
-      # in CI.  The package lives in package/ and needs no feed machinery.
-      - name: Add the Argon theme
-        env:
-          ARGON_REPO: https://github.com/jerrykuku/luci-theme-argon.git
-        run: |
-          set -eu
-          git clone --depth 1 "$ARGON_REPO" openwrt/package/luci-theme-argon
-
-          # Tracking master, so record what that actually was for this image.
-          ARGON_COMMIT=$(git -C openwrt/package/luci-theme-argon \
-                             rev-parse --short HEAD)
-          git -C openwrt/package/luci-theme-argon --no-pager log -1 \
-              --format='argon %h  %ci  %s'
-          echo "ARGON_COMMIT=$ARGON_COMMIT" >> "$GITHUB_ENV"
-
-          cd openwrt
-          echo 'CONFIG_PACKAGE_luci-theme-argon=y' >> .config
-          make defconfig
+          nss/scripts/setup.sh "$GITHUB_WORKSPACE/openwrt"
 
       - name: Verify the expected packages are selected
         run: |
@@ -152,7 +98,7 @@ jobs:
             CONFIG_NSS_FIRMWARE_VERSION_12_5 \
             CONFIG_LUCI_LANG_zh_Hans \
             CONFIG_PACKAGE_luci-i18n-base-zh-cn \
-            CONFIG_PACKAGE_luci-theme-argon
+            CONFIG_PACKAGE_luci-theme-bootstrap
           do
             if grep -q "^${sym}=y" .config; then
               echo "  ok   $sym"
@@ -199,83 +145,26 @@ jobs:
         if: success()
         run: ls -lh "$FIRMWARE" && cat openwrt/bin/targets/qualcommax/ipq50xx/*.manifest | head -40
 
-      # The bootloader's web recovery page does not take a .ubi.  It runs
-      # `imgaddr=$fileaddr && source $imgaddr:script` on the upload, so the
-      # payload has to be a FIT carrying its own flashing script; a raw ubinized
-      # image reports success and writes nothing.  See docs/RECOVERY.md.
-      - name: Build the U-Boot recovery image
-        if: success()
-        run: |
-          set -eu
-          UBI=$(ls "$FIRMWARE"/*-squashfs-factory.ubi)
-          BASE=$(basename "$UBI" -squashfs-factory.ubi)
-          MIBIB="$GITHUB_WORKSPACE/pzl8-nss/scripts/pz-l8-116m-mibib.bin"
-
-          # Two variants, see docs/RECOVERY.md:
-          #   -uboot-recovery.fit       writes rootfs only. Correct on the single
-          #                             110M layout (this project's, and nwrt's).
-          #   -uboot-recovery-116m.fit  also writes the 110M partition table first,
-          #                             converting a genuine A/B factory board. The
-          #                             MIBIB is read back and byte-compared before
-          #                             rootfs is touched; still, writing MIBIB can
-          #                             hard-brick on power loss, which is why it is
-          #                             a separate, clearly-named file rather than
-          #                             the default.
-          build_fit() {   # <out.fit> [mibib.bin]
-            # OW first so a build tree's own mkimage wins; the apt ones are the
-            # fallback and work equally well.
-            OW="$GITHUB_WORKSPACE/openwrt" \
-              python3 "$GITHUB_WORKSPACE/pzl8-nss/scripts/mkrecovery.py" "$UBI" "$1" ${2:+"$2"}
-            # The bootloader refuses anything over 32 MiB, so a FIT that grew past
-            # it would be published and then rejected at the one moment it is
-            # needed.  Fail the build instead.
-            SIZE=$(stat -c %s "$1")
-            echo "$(basename "$1"): $SIZE bytes"
-            if [ "$SIZE" -gt 33554432 ]; then
-              echo "::error::$(basename "$1") is $SIZE bytes; U-Boot refuses over 0x2000000"
-              exit 1
-            fi
-            ( cd "$FIRMWARE" && sha256sum -b "$(basename "$1")" >> sha256sums )
-          }
-
-          build_fit "$FIRMWARE/$BASE-uboot-recovery.fit"
-          build_fit "$FIRMWARE/$BASE-uboot-recovery-116m.fit" "$MIBIB"
-          ls -lh "$FIRMWARE"/*-uboot-recovery*.fit
-
       - name: Write the release notes
         if: success()
         run: |
           cd "$GITHUB_WORKSPACE"
           IPQ=openwrt/bin/targets/qualcommax/ipq50xx
           {
-            echo "OpenWrt \`$OPENWRT_REF\` with Qualcomm NSS offload for the CMCC PZ-L8."
+            echo "OpenWrt \`$OPENWRT_REF\` with Qualcomm NSS offload for the HONOR XD27."
             echo
             echo "| file | use |"
             echo "|---|---|"
             echo "| \`*-squashfs-sysupgrade.bin\` | upgrading a router that already runs OpenWrt - \`sysupgrade -n\` |"
-            echo "| \`*-uboot-recovery.fit\` | **the U-Boot web recovery at 192.168.10.10** - the only file that page accepts |"
-            echo "| \`*-uboot-recovery-116m.fit\` | same page, but **also writes the 110M partition table** to convert a genuine A/B factory board (see [docs/RECOVERY.md](docs/RECOVERY.md); can brick on power loss mid-write) |"
             echo "| \`*-squashfs-factory.ubi\` | a forced \`sysupgrade -n -F\` from a vendor image, which writes it with \`ubiformat\` |"
             echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
             echo
-            echo "Default LAN address is **192.168.10.1**."
-            echo
-            echo "Includes [SONiC fullcone NAT](https://github.com/mufeng05/openwrt-sonic-fullcone),"
-            echo "**off by default**: tick Fullcone NAT under Network > Firewall > General"
-            echo "Settings, then in the wan zone's settings."
-            echo
-            echo "The U-Boot page does **not** take a \`.ubi\`: it runs"
-            echo "\`source \$imgaddr:script\` on the upload, so a raw image reports"
-            echo "success and writes nothing. Use the \`.fit\`. Both routes, and the"
-            echo "flash layout, are in [docs/RECOVERY.md](docs/RECOVERY.md)."
-            echo
-            echo '```'
             cat build-info.txt
             echo '```'
             echo
             echo "sha256:"
             echo '```'
-            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb|uboot-recovery.*\.fit' $IPQ/sha256sums || cat $IPQ/sha256sums
+            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb' $IPQ/sha256sums || cat $IPQ/sha256sums
             echo '```'
           } > release-notes.md
           cat release-notes.md
@@ -284,7 +173,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: cmcc_pz-l8-nss_${{ env.DATE }}
+          name: honor_xd27-nss_${{ env.DATE }}
           path: |
             ${{ env.FIRMWARE }}/*.bin
             ${{ env.FIRMWARE }}/*.ubi
@@ -306,13 +195,12 @@ jobs:
         uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: build-${{ env.DATE }}
-          name: CMCC PZ-L8 NSS ${{ env.DATE }}
+          name: HONOR XD27 NSS ${{ env.DATE }}
           body_path: release-notes.md
           make_latest: true
           files: |
             ${{ env.FIRMWARE }}/*-sysupgrade.bin
             ${{ env.FIRMWARE }}/*-factory.ubi
-            ${{ env.FIRMWARE }}/*-uboot-recovery*.fit
             ${{ env.FIRMWARE }}/*-initramfs-uImage.itb
             ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums
