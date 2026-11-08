@@ -33,7 +33,7 @@ env:
 # runs get their own group per run id so a push cannot cancel them.
 concurrency:
   group: build-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -111,10 +111,13 @@ jobs:
       - name: Download sources
         run: |
           cd openwrt
-          make download -j8 V=s 2>&1 | grep -iE '^(Downloading|ERROR|.*failed)' || true
-          # a zero-length download is a silent poison pill later in the build
-          find dl -size -1024c -type f -print -delete || true
-
+          make download -j8 V=s 2>&1 | tee dl.log
+          if grep -qiE 'error (404|403|500|502|503)|failed to download|md5sum.*mismatch' dl.log; then
+            echo "::error::Download failed. Check dl.log for details."
+            grep -iE 'error|fail|mismatch' dl.log | tail -50
+            exit 1
+          fi
+          find dl -type f -size 0 -print -delete
       - name: Build
         id: build
         run: |
@@ -132,8 +135,6 @@ jobs:
             echo "openwrt_ref=$OPENWRT_REF"
             echo "openwrt_commit=$(git rev-parse --short HEAD)"
             echo "project_commit=$(git -C "$GITHUB_WORKSPACE/nss" rev-parse --short HEAD)"
-            echo "argon_commit=${ARGON_COMMIT:-none}"
-            echo "fullcone_commit=${FULLCONE_COMMIT:-none}"
             echo "date=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } | tee "$GITHUB_WORKSPACE/build-info.txt"
           # Seconds, because this is the tag: at minute resolution two runs
