@@ -1,11 +1,11 @@
 name: Build HONOR XD27 (NSS)
 
 on:
-  push:
-    branches: [ main ]
-    paths-ignore: [ 'docs/**', 'README.md', '**.md' ]
-  pull_request:
-    branches: [ main ]
+#  push:
+#    branches: [ main ]
+#    paths-ignore: [ 'docs/**', 'README.md', '**.md' ]
+#  pull_request:
+#    branches: [ main ]
   workflow_dispatch:
     inputs:
       openwrt_ref:
@@ -131,7 +131,7 @@ jobs:
           {
             echo "openwrt_ref=$OPENWRT_REF"
             echo "openwrt_commit=$(git rev-parse --short HEAD)"
-            echo "project_commit=$(git -C "$GITHUB_WORKSPACE/pzl8-nss" rev-parse --short HEAD)"
+            echo "project_commit=$(git -C "$GITHUB_WORKSPACE/nss" rev-parse --short HEAD)"
             echo "argon_commit=${ARGON_COMMIT:-none}"
             echo "fullcone_commit=${FULLCONE_COMMIT:-none}"
             echo "date=$(date -u '+%Y-%m-%d %H:%M UTC')"
