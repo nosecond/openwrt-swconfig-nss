@@ -76,6 +76,10 @@ jobs:
           path: openwrt
           fetch-depth: 0
 
+      - name: Add msd_lite feed
+        run: |
+          echo 'src-git msd https://github.com/nosecond/msd_lite.git' >> openwrt/feeds.conf.default
+
       - name: Prepare the tree
         # No chmod here on purpose: git records setup.sh as 100755 and
         # actions/checkout preserves it, so if this ever fails with Permission
@@ -98,7 +102,10 @@ jobs:
             CONFIG_NSS_FIRMWARE_VERSION_12_5 \
             CONFIG_LUCI_LANG_zh_Hans \
             CONFIG_PACKAGE_luci-i18n-base-zh-cn \
-            CONFIG_PACKAGE_luci-theme-bootstrap
+            CONFIG_PACKAGE_luci-theme-bootstrap \
+            CONFIG_PACKAGE_msd_lite \
+            CONFIG_PACKAGE_luci-app-msd_lite \
+            CONFIG_PACKAGE_luci-i18n-msd_lite-zh-cn
           do
             if grep -q "^${sym}=y" .config; then
               echo "  ok   $sym"
@@ -108,16 +115,28 @@ jobs:
           done
           [ "$missing" = 0 ] || { echo "config seed did not survive defconfig"; exit 1; }
 
+      - name: Cache OpenWrt Sources & Toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir/toolchain-*
+            openwrt/staging_dir/host*
+          key: ${{ runner.os }}-openwrt-${{ env.OPENWRT_REF }}-${{ hashFiles('nss/scripts/setup.sh', 'nss/openwrt/*.patch') }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-${{ env.OPENWRT_REF }}-
+
       - name: Download sources
         run: |
           cd openwrt
           make download -j8 V=s 2>&1 | tee dl.log
-          if grep -qiE 'error (404|403|500|502|503)|failed to download|md5sum.*mismatch' dl.log; then
+          if grep -qiE 'error (404|403|500|502|503)|failed to download' dl.log; then
             echo "::error::Download failed. Check dl.log for details."
-            grep -iE 'error|fail|mismatch' dl.log | tail -50
+            grep -iE 'error|fail' dl.log | tail -50
             exit 1
           fi
           find dl -type f -size 0 -print -delete
+
       - name: Build
         id: build
         run: |
@@ -153,20 +172,6 @@ jobs:
           IPQ=openwrt/bin/targets/qualcommax/ipq50xx
           {
             echo "OpenWrt \`$OPENWRT_REF\` with Qualcomm NSS offload for the HONOR XD27."
-            echo
-            echo "| file | use |"
-            echo "|---|---|"
-            echo "| \`*-squashfs-sysupgrade.bin\` | upgrading a router that already runs OpenWrt - \`sysupgrade -n\` |"
-            echo "| \`*-squashfs-factory.ubi\` | a forced \`sysupgrade -n -F\` from a vendor image, which writes it with \`ubiformat\` |"
-            echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
-            echo
-            cat build-info.txt
-            echo '```'
-            echo
-            echo "sha256:"
-            echo '```'
-            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb' $IPQ/sha256sums || cat $IPQ/sha256sums
-            echo '```'
           } > release-notes.md
           cat release-notes.md
 
@@ -181,7 +186,6 @@ jobs:
             ${{ env.FIRMWARE }}/*.fit
             ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums
-            build-info.txt
           if-no-files-found: error
 
       # Every green build of main gets a release, because run artifacts expire
