@@ -380,7 +380,7 @@ index 60348cc..73e10c9 100644
  TARGET_DEVICES += glinet_gl-b3000
  
 +define Device/honor_xd27
-+	$(call Device/FitImageLzma)
++	$(call Device/FitImage)
 +	$(call Device/UbiFit)
 +	DEVICE_VENDOR := HONOR
 +	DEVICE_MODEL := XD27
