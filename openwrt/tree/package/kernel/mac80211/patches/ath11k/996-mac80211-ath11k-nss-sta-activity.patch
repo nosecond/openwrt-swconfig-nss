@@ -1,0 +1,49 @@
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2865,6 +2865,8 @@ void ieee80211_sta_uapsd_trigger(struct ieee80211_sta *sta, u8 tid);
+ void ieee80211_sta_set_buffered(struct ieee80211_sta *sta,
+ 				u8 tid, bool buffered);
+ 
++void ieee80211_sta_nss_activity(struct ieee80211_sta *pubsta);
++
+ /**
+  * ieee80211_get_tx_rates - get the selected transmit rates for a packet
+  *
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -1629,6 +1629,14 @@ void ieee80211_sta_set_buffered(struct ieee80211_sta *pubsta,
+ }
+ EXPORT_SYMBOL(ieee80211_sta_set_buffered);
+ 
++void ieee80211_sta_nss_activity(struct ieee80211_sta *pubsta)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++
++	sta->deflink.rx_stats.last_rx = jiffies;
++}
++EXPORT_SYMBOL(ieee80211_sta_nss_activity);
++
+ void ieee80211_sta_register_airtime(struct ieee80211_sta *pubsta, u8 tid,
+ 				    u32 tx_airtime, u32 rx_airtime)
+ {
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -1529,6 +1529,9 @@ ath11k_update_per_peer_tx_stats(struct ath11k *ar,
+ 	arsta->tx_duration += tx_duration;
+ 	memcpy(&arsta->last_txrate, &arsta->txrate, sizeof(struct rate_info));
+ 
++	if (succ_pkts)
++		ieee80211_sta_nss_activity(sta);
++
+ 	/* PPDU stats reported for mgmt packet doesn't have valid tx bytes.
+ 	 * So skip peer stats update for mgmt packets.
+ 	 */
+@@ -3692,6 +3695,7 @@ int ath11k_dp_rx_process_mon_status(struct ath11k_base *ab, int mac_id,
+ 		}
+ 
+ 		arsta = ath11k_sta_to_arsta(peer->sta);
++		ieee80211_sta_nss_activity(peer->sta);
+ 		ath11k_dp_rx_update_peer_stats(arsta, ppdu_info);
+ 
+ 		/* the only place a station's receive rate can come from once
+
