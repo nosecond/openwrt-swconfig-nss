@@ -1,0 +1,155 @@
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -662,6 +662,7 @@ struct ath11k {
+ 	struct ath11k_pdev_wmi *wmi;
+ 	struct ath11k_pdev_dp dp;
+ 	u8 mac_addr[ETH_ALEN];
++	struct delayed_work nss_tx_wake_work;
+ 	struct ath11k_he ar_he;
+ 	enum ath11k_state state;
+ 	bool supports_6ghz;
+--- a/drivers/net/wireless/ath/ath11k/nss.c
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -1772,6 +1772,9 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
+ 	if (skb->len <= ETH_HLEN)
+ 		return -EINVAL;
+ 
++	if (skb_is_nonlinear(skb) && skb_linearize(skb))
++		return -ENOMEM;
++
+ 	/*
+ 	 * NSS writes its own headers in front of a full-size frame, and a
+ 	 * short headroom is what a converted 802.11 frame arrives with.
+@@ -1782,8 +1785,11 @@ int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
+ 
+ 	skb->next = NULL;
+ 	status = nss_wifi_vdev_tx_buf(nss->ctx, skb, arvif->nss.if_num);
+-	if (status != NSS_TX_SUCCESS)
++	if (status != NSS_TX_SUCCESS) {
++		if (status == NSS_TX_FAILURE_QUEUE)
++			return -EBUSY;
+ 		return -EIO;
++	}
+ 
+ 	/* NSS owns the skb now; ath11k treats this as queued to TCL. */
+ 	return 0;
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -706,6 +706,7 @@ void ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id)
+ 	u32 *desc;
+ 	u32 msdu_id;
+ 	u8 mac_id;
++	bool wake_queues = false;
+ 
+ 	if (ath11k_nss_dp_owned(ab))
+ 		return;
+@@ -773,7 +774,16 @@ void ath11k_dp_tx_completion_handler(struct ath11k_base *ab, int ring_id)
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 
+ 		ath11k_dp_tx_complete_msdu(ar, msdu, &ts);
++		wake_queues = true;
+ 	}
++
++	if (wake_queues) {
++		int i;
++
++		for (i = 0; i < ab->num_radios; i++)
++			if (ab->pdevs[i].ar)
++				ieee80211_wake_queues(ab->pdevs[i].ar->hw);
++	}
+ }
+ 
+ int ath11k_dp_tx_send_reo_cmd(struct ath11k_base *ab, struct dp_rx_tid *rx_tid,
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -1013,6 +1013,52 @@ static int ath11k_mac_mgmt_tx(struct ath11k *ar, struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++static void ath11k_mac_nss_tx_wake_work(struct work_struct *work)
++{
++	struct ath11k *ar = container_of(work, struct ath11k,
++					 nss_tx_wake_work.work);
++
++	ieee80211_wake_queues(ar->hw);
++}
++
++static bool ath11k_mac_tx_rings_have_space(struct ath11k_base *ab,
++					   struct sk_buff *skb)
++{
++	struct hal_srng *tcl_ring;
++	u32 ring_selector;
++	u8 primary_id, i;
++	int num_free;
++
++	ring_selector = ab->hw_params.hw_ops->get_ring_selector(skb);
++	primary_id = ring_selector % ab->hw_params.max_tx_ring;
++
++	tcl_ring = &ab->hal.srng_list[ab->dp.tx_ring[primary_id].tcl_data_ring.ring_id];
++	spin_lock_bh(&tcl_ring->lock);
++	num_free = ath11k_hal_srng_src_num_free(ab, tcl_ring, true);
++	spin_unlock_bh(&tcl_ring->lock);
++
++	if (num_free > 0)
++		return true;
++
++	if (!ab->hw_params.tcl_ring_retry)
++		return false;
++
++	for (i = 0; i < ab->hw_params.max_tx_ring; i++) {
++		if (i == primary_id)
++			continue;
++
++		tcl_ring = &ab->hal.srng_list[ab->dp.tx_ring[i].tcl_data_ring.ring_id];
++		spin_lock_bh(&tcl_ring->lock);
++		num_free = ath11k_hal_srng_src_num_free(ab, tcl_ring, true);
++		spin_unlock_bh(&tcl_ring->lock);
++
++		if (num_free > 0)
++			return true;
++	}
++
++	return false;
++}
++
+ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+ 			     struct ieee80211_tx_control *control,
+ 			     struct sk_buff *skb)
+@@ -1050,8 +1096,21 @@ static void ath11k_mac_op_tx(struct ieee80211_hw *hw,
+ 	if (control->sta)
+ 		arsta = ath11k_sta_to_arsta(control->sta);
+ 
++	if (unlikely(!ath11k_nss_dp_owned(ar->ab)) &&
++	    unlikely(!ath11k_mac_tx_rings_have_space(ar->ab, skb)))
++		ieee80211_stop_queues(ar->hw);
++
+ 	ret = ath11k_dp_tx(ar, arvif, arsta, skb);
+ 	if (unlikely(ret)) {
++		if (ret == -EBUSY && ath11k_nss_dp_owned(ar->ab)) {
++			ieee80211_stop_queues(ar->hw);
++			ieee80211_queue_delayed_work(ar->hw,
++						     &ar->nss_tx_wake_work,
++						     1);
++			ieee80211_free_txskb(ar->hw, skb);
++			return;
++		}
++
+ 		ath11k_warn(ar->ab, "failed to transmit frame %d\n", ret);
+ 		ieee80211_free_txskb(ar->hw, skb);
+ 	}
+@@ -1374,6 +1433,7 @@ static void ath11k_mac_op_stop(struct ieee80211_hw *hw, bool suspend)
+ 	cancel_work_sync(&ar->channel_update_work);
+ 	cancel_work_sync(&ar->regd_update_work);
+ 	cancel_work_sync(&ar->ab->update_11d_work);
++	cancel_delayed_work_sync(&ar->nss_tx_wake_work);
+ 
+ 	if (ar->state_11d == ATH11K_11D_PREPARING) {
+ 		ar->state_11d = ATH11K_11D_IDLE;
+@@ -2343,6 +2403,7 @@ int ath11k_mac_allocate(struct ath11k_base *ab)
+ 		INIT_WORK(&ar->regd_update_work, ath11k_regd_update_work);
+ 
+ 		INIT_WORK(&ar->wmi_mgmt_tx_work, ath11k_mgmt_over_wmi_tx_work);
++		INIT_DELAYED_WORK(&ar->nss_tx_wake_work, ath11k_mac_nss_tx_wake_work);
+ 		skb_queue_head_init(&ar->wmi_mgmt_tx_queue);
+ 
+ 		clear_bit(ATH11K_FLAG_MONITOR_STARTED, &ar->monitor_flags);
